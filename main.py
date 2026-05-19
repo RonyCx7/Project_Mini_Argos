@@ -1,10 +1,11 @@
 """
-Project mini-Argos v1 — Fases 1-5: UI + Stream + YOLO + Reconocimiento Facial
-===============================================================================
+Project mini-Argos v1 — Fases 1-6: UI + Stream + YOLO + FaceNet + Control de Acceso
+=====================================================================================
 Módulo principal del proyecto. Gestiona la configuración RTMP mediante una
 ventana tkinter, abre el stream con latencia cero (multithreading), detecta
-personas con YOLOv8 (GPU), identifica rostros con FaceNet (facenet-pytorch)
-y emite alertas sonoras asíncronas al reconocer a un usuario registrado.
+personas con YOLOv8 (GPU), identifica rostros con FaceNet (facenet-pytorch),
+evalúa permisos de acceso por área y emite alarmas sonoras continuas cuando
+se detecta personal no autorizado.
 
 Flujo completo:
     Fase 1 — UI de configuración:
@@ -26,14 +27,20 @@ Flujo completo:
        10. El hilo principal toma el último frame del LectorStream, ejecuta
            la inferencia YOLO filtrando solo la clase 'person' (0).
 
-    Fase 5 — Reconocimiento facial + Alertas sonoras:
+    Fase 5 — Reconocimiento facial:
        11. Para cada persona detectada por YOLO, recorta la ROI y la pasa
            por MTCNN (aislamiento de rostro) + InceptionResnetV1 (embedding).
        12. Compara el embedding contra la base de datos `rostros/embeddings.pt`
            usando distancia L2. Si la distancia < umbral -> identifica al usuario.
-       13. Emite un sonido asíncrono (winsound) la primera vez que reconoce
-           a cada usuario (one-shot por sesión).
-       14. El usuario puede presionar 'q' para cerrar limpiamente.
+
+    Fase 6 — Control de acceso por áreas + Alarma continua:
+       13. Verifica si el usuario identificado está autorizado para el área
+           actual (diccionario de permisos por área).
+       14. AUTORIZADO: bbox verde + "[Nombre] - AUTORIZADO".
+       15. NO AUTORIZADO / Desconocido: bbox rojo + alarma sonora en bucle.
+       16. La alarma se detiene automáticamente cuando no hay personas no
+           autorizadas en pantalla.
+       17. El usuario puede presionar 'q' para cerrar limpiamente.
 """
 
 import json
@@ -277,20 +284,20 @@ class VentanaConfig:
 
 
 # ---------------------------------------------------------------------------
-# Fases 3.2 + 5: Detección YOLO + Reconocimiento Facial + Alertas
+# Fases 3.2 + 5 + 6: Detección YOLO + Reconocimiento + Control de Acceso
 # ---------------------------------------------------------------------------
 
 # Constantes de visualización — se definen a nivel de módulo para no
 # recrear objetos en cada iteración del bucle de captura.
-_FUENTE        = cv2.FONT_HERSHEY_SIMPLEX
-_ESCALA_TEXTO  = 0.75
-_GROSOR_TEXTO  = 2
-_COLOR_VERDE   = (0, 220, 80)    # BGR — persona identificada
-_COLOR_ROJO    = (50, 50, 235)   # BGR — sin persona / desconocido
-_COLOR_BOX     = (124, 106, 247) # BGR — bounding box (morado del tema)
-_COLOR_BOX_OK  = (0, 220, 80)    # BGR — bounding box persona reconocida
-_COLOR_AMARILLO = (0, 220, 255)  # BGR — bounding box desconocido
-_POS_TEXTO     = (14, 38)        # Margen superior izquierdo del overlay
+_FUENTE         = cv2.FONT_HERSHEY_SIMPLEX
+_ESCALA_TEXTO   = 0.75
+_GROSOR_TEXTO   = 2
+_COLOR_VERDE    = (0, 220, 80)    # BGR — persona autorizada
+_COLOR_ROJO     = (50, 50, 235)   # BGR — texto "sin persona"
+_COLOR_ROJO_PURO = (0, 0, 255)   # BGR — bbox no autorizado (rojo puro)
+_COLOR_BOX      = (124, 106, 247) # BGR — bounding box genérico (morado)
+_COLOR_BOX_OK   = (0, 220, 80)   # BGR — bounding box autorizado
+_POS_TEXTO      = (14, 38)       # Margen superior izquierdo del overlay
 
 # Ruta a la base de datos de embeddings generada por registrar.py
 _ARCHIVO_EMBEDDINGS = Path(__file__).parent / "rostros" / "embeddings.pt"
@@ -299,6 +306,14 @@ _ARCHIVO_EMBEDDINGS = Path(__file__).parent / "rostros" / "embeddings.pt"
 # Valores menores = más estricto (menos falsos positivos, más falsos negativos).
 # Rango recomendado: 0.7 - 1.0 para FaceNet con VGGFace2.
 _UMBRAL_RECONOCIMIENTO = 0.8
+
+# Fase 6: Área actual del stream y permisos de acceso.
+# El stream RTMP se trata como "Area 1" por defecto.
+# Los nombres deben coincidir exactamente con los registrados en embeddings.pt.
+_AREA_ACTUAL = "Area 1"
+_USUARIOS_AUTORIZADOS = {
+    "Area 1": ["Juan Perez", "Maria Lopez"],
+}
 
 
 class LectorStream:
@@ -532,8 +547,13 @@ def iniciar_stream(url: str) -> None:
     # ── Cargar base de datos de rostros ────────────────────────────────
     base_rostros = _cargar_base_rostros(dispositivo)
 
-    # ── Set de usuarios ya saludados (one-shot por sesión) ─────────────
-    usuarios_saludados: set[str] = set()
+    # ── Fase 6: Lista de autorizados para el área actual ───────────────
+    lista_autorizados = _USUARIOS_AUTORIZADOS.get(_AREA_ACTUAL, [])
+    print(f"[ACCESO] Área activa: '{_AREA_ACTUAL}'")
+    print(f"[ACCESO] Usuarios autorizados: {lista_autorizados}")
+
+    # Bandera de alarma: controla el sonido continuo en bucle
+    alarma_activa = False
 
     # ── Iniciar lector de stream con hilo en segundo plano ─────────────
     print(f"[STREAM] Conectando a: {url}")
@@ -569,7 +589,10 @@ def iniciar_stream(url: str) -> None:
         # 2. Extraer bounding boxes del primer (y único) resultado
         cajas = resultados[0].boxes
 
-        # 3. Para cada persona detectada: identificar + anotar
+        # Fase 6: rastrear si hay alguien no autorizado en ESTE frame
+        hay_no_autorizado_en_frame = False
+
+        # 3. Para cada persona detectada: identificar + evaluar acceso
         if len(cajas) > 0:
             for caja in cajas:
                 x1, y1, x2, y2 = caja.xyxy[0].int().tolist()
@@ -577,7 +600,6 @@ def iniciar_stream(url: str) -> None:
                 # -- Intentar reconocimiento facial --
                 nombre_detectado = None
                 try:
-                    # Recortar la ROI de la persona del frame original
                     alto_frame, ancho_frame = frame.shape[:2]
                     rx1 = max(0, x1)
                     ry1 = max(0, y1)
@@ -586,42 +608,36 @@ def iniciar_stream(url: str) -> None:
 
                     roi = frame[ry1:ry2, rx1:rx2]
 
-                    # Validar que el recorte tenga dimensiones razonables
                     if roi.shape[0] > 30 and roi.shape[1] > 30:
                         nombre_detectado = _identificar_rostro(
                             roi, mtcnn, modelo_facenet,
                             base_rostros, dispositivo,
                         )
                 except Exception as exc:
-                    # Si falla el recorte o el tensor por dimensiones,
-                    # simplemente continuamos sin identificar
                     print(f"[ADVERTENCIA] Error en reconocimiento facial: {exc}")
 
-                # -- Dibujar bounding box + etiqueta --
-                if nombre_detectado:
-                    # Persona reconocida -> bounding box verde + nombre
+                # -- Fase 6: Evaluar autorización --
+                if nombre_detectado and nombre_detectado in lista_autorizados:
+                    # Persona reconocida Y autorizada -> verde
                     color_caja = _COLOR_BOX_OK
-                    etiqueta = nombre_detectado
-
-                    # Alerta sonora one-shot (sin bloquear el hilo principal)
-                    if nombre_detectado not in usuarios_saludados:
-                        usuarios_saludados.add(nombre_detectado)
-                        print(f"[ALERTA] Usuario reconocido: {nombre_detectado}")
-                        winsound.PlaySound(
-                            "SystemAsterisk",
-                            winsound.SND_ALIAS | winsound.SND_ASYNC,
-                        )
+                    etiqueta = f"{nombre_detectado} - AUTORIZADO"
                 else:
-                    # Persona no reconocida -> bounding box amarillo
-                    color_caja = _COLOR_AMARILLO
-                    etiqueta = "Desconocido"
+                    # No reconocida O no autorizada -> rojo puro
+                    color_caja = _COLOR_ROJO_PURO
+                    hay_no_autorizado_en_frame = True
 
+                    if nombre_detectado:
+                        etiqueta = f"{nombre_detectado} - NO AUTORIZADO"
+                    else:
+                        etiqueta = "Desconocido - NO AUTORIZADO"
+
+                # -- Dibujar bounding box + etiqueta --
                 cv2.rectangle(
                     frame, (x1, y1), (x2, y2),
                     color_caja, thickness=2,
                 )
 
-                # Fondo semitransparente para la etiqueta (mejor legibilidad)
+                # Fondo sólido para la etiqueta (mejor legibilidad)
                 (tw, th), _ = cv2.getTextSize(
                     etiqueta, _FUENTE, 0.6, 1,
                 )
@@ -650,6 +666,29 @@ def iniciar_stream(url: str) -> None:
                 cv2.LINE_AA,
             )
 
+        # -- Fase 6: Control de alarma sonora continua --
+        # La alarma suena EN BUCLE mientras haya al menos una persona
+        # no autorizada visible. Se apaga cuando todas salen de cámara.
+        if hay_no_autorizado_en_frame:
+            if not alarma_activa:
+                alarma_activa = True
+                print("[ALARMA] ¡Persona NO AUTORIZADA detectada! Activando alarma...")
+                try:
+                    winsound.PlaySound(
+                        "SystemHand",
+                        winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_LOOP,
+                    )
+                except Exception:
+                    pass  # Silenciar si winsound falla (ej. sin dispositivo de audio)
+        else:
+            if alarma_activa:
+                alarma_activa = False
+                print("[ALARMA] Zona despejada. Desactivando alarma.")
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                except Exception:
+                    pass  # SND_PURGE es seguro incluso si no había sonido
+
         # 4. Mostrar el frame anotado (BGR, correcto para OpenCV)
         cv2.imshow(nombre_ventana, frame)
 
@@ -659,6 +698,12 @@ def iniciar_stream(url: str) -> None:
             break
 
     # ── Limpieza de recursos ───────────────────────────────────────────
+    # Asegurar que la alarma se apague al salir
+    if alarma_activa:
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
     lector.detener()
     cv2.destroyAllWindows()
     print("[STREAM] Recursos liberados. Programa finalizado.")
@@ -670,15 +715,15 @@ def iniciar_stream(url: str) -> None:
 
 def main() -> None:
     """
-    Punto de entrada principal del programa (Fases 1-5).
+    Punto de entrada principal del programa (Fases 1-6).
 
     Secuencia:
         1. Carga la configuración previa y lanza la UI de tkinter (Fase 1).
         2. Una vez cerrada la UI con éxito, recupera la URL validada
            leyendo nuevamente `config.json` (fuente de verdad compartida).
         3. Si existe una URL válida, inicia el stream con detección de
-           personas (YOLO), reconocimiento facial (FaceNet) y alertas
-           sonoras (winsound) via multithreading (Fases 2-5).
+           personas (YOLO), reconocimiento facial (FaceNet), control de
+           acceso por áreas y alarmas sonoras (Fases 2-6).
         4. Si la ventana fue cerrada sin guardar (e.g. clic en la X),
            la URL estará vacía y el programa termina sin iniciar el stream.
     """
@@ -689,7 +734,7 @@ def main() -> None:
     VentanaConfig(root, url_inicial=url_guardada)
     root.mainloop()   # Bloquea hasta que el usuario destruya la ventana
 
-    # ── Fases 2-5: Stream + YOLO + FaceNet + Alertas ──────────────────
+    # ── Fases 2-6: Stream + YOLO + FaceNet + Acceso + Alarmas ─────────
     # Releer config.json como fuente de verdad: garantiza que usamos la
     # URL recién guardada incluso si el usuario la modificó en la UI.
     url_activa = cargar_config()
