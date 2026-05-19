@@ -1,17 +1,18 @@
 """
-Project mini-Argos v1 — Fases 1, 2 y 3.2: UI + Stream + Detección con YOLO
-===========================================================================
+Project mini-Argos v1 — Fases 1-5: UI + Stream + YOLO + Reconocimiento Facial
+===============================================================================
 Módulo principal del proyecto. Gestiona la configuración RTMP mediante una
-ventana tkinter y, una vez validada la URL, abre el stream y detecta personas
-en tiempo real usando YOLOv8 acelerado por GPU (CUDA).
+ventana tkinter, abre el stream con latencia cero (multithreading), detecta
+personas con YOLOv8 (GPU), identifica rostros con FaceNet (facenet-pytorch)
+y emite alertas sonoras asíncronas al reconocer a un usuario registrado.
 
 Flujo completo:
     Fase 1 — UI de configuración:
         1. Carga la última URL RTMP desde `config.json` (si existe).
         2. Muestra la ventana de configuración al usuario.
         3. Valida la URL ingresada al presionar "Conectar".
-        4. Si es válida → guarda en `config.json` y destruye la ventana.
-        5. Si es inválida → muestra un messagebox de error sin cerrar la ventana.
+        4. Si es válida -> guarda en `config.json` y destruye la ventana.
+        5. Si es inválida -> muestra un messagebox de error sin cerrar la ventana.
 
     Fase 2 — Captura del stream (con multithreading):
         6. Recupera la URL validada desde `config.json`.
@@ -23,9 +24,16 @@ Flujo completo:
     Fase 3.2 — Detección de personas (YOLOv8 + CUDA):
         9. Carga el modelo YOLOv8n (se descarga automáticamente la primera vez).
        10. El hilo principal toma el último frame del LectorStream, ejecuta
-           la inferencia YOLO filtrando solo la clase 'person' (0), dibuja
-           bounding boxes y superpone el estado en pantalla.
-       11. El usuario puede presionar 'q' para cerrar limpiamente.
+           la inferencia YOLO filtrando solo la clase 'person' (0).
+
+    Fase 5 — Reconocimiento facial + Alertas sonoras:
+       11. Para cada persona detectada por YOLO, recorta la ROI y la pasa
+           por MTCNN (aislamiento de rostro) + InceptionResnetV1 (embedding).
+       12. Compara el embedding contra la base de datos `rostros/embeddings.pt`
+           usando distancia L2. Si la distancia < umbral -> identifica al usuario.
+       13. Emite un sonido asíncrono (winsound) la primera vez que reconoce
+           a cada usuario (one-shot por sesión).
+       14. El usuario puede presionar 'q' para cerrar limpiamente.
 """
 
 import json
@@ -34,10 +42,11 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
+import winsound
 
-# pyrefly: ignore [missing-import]
 import cv2
-# pyrefly: ignore [missing-import]
+import torch
+from facenet_pytorch import MTCNN, InceptionResnetV1
 from ultralytics import YOLO
 
 
@@ -268,7 +277,7 @@ class VentanaConfig:
 
 
 # ---------------------------------------------------------------------------
-# Fase 3.2: Captura RTMP (Multithreading) + Detección con YOLO (GPU)
+# Fases 3.2 + 5: Detección YOLO + Reconocimiento Facial + Alertas
 # ---------------------------------------------------------------------------
 
 # Constantes de visualización — se definen a nivel de módulo para no
@@ -276,10 +285,20 @@ class VentanaConfig:
 _FUENTE        = cv2.FONT_HERSHEY_SIMPLEX
 _ESCALA_TEXTO  = 0.75
 _GROSOR_TEXTO  = 2
-_COLOR_VERDE   = (0, 220, 80)    # BGR — persona detectada
-_COLOR_ROJO    = (50, 50, 235)   # BGR — sin persona
+_COLOR_VERDE   = (0, 220, 80)    # BGR — persona identificada
+_COLOR_ROJO    = (50, 50, 235)   # BGR — sin persona / desconocido
 _COLOR_BOX     = (124, 106, 247) # BGR — bounding box (morado del tema)
+_COLOR_BOX_OK  = (0, 220, 80)    # BGR — bounding box persona reconocida
+_COLOR_AMARILLO = (0, 220, 255)  # BGR — bounding box desconocido
 _POS_TEXTO     = (14, 38)        # Margen superior izquierdo del overlay
+
+# Ruta a la base de datos de embeddings generada por registrar.py
+_ARCHIVO_EMBEDDINGS = Path(__file__).parent / "rostros" / "embeddings.pt"
+
+# Umbral de distancia L2 para reconocimiento facial.
+# Valores menores = más estricto (menos falsos positivos, más falsos negativos).
+# Rango recomendado: 0.7 - 1.0 para FaceNet con VGGFace2.
+_UMBRAL_RECONOCIMIENTO = 0.8
 
 
 class LectorStream:
@@ -370,39 +389,151 @@ class LectorStream:
         print("[HILO] Lector de stream detenido y recurso liberado.")
 
 
+def _cargar_base_rostros(dispositivo: torch.device) -> dict:
+    """
+    Carga la base de datos de embeddings desde `rostros/embeddings.pt`.
+
+    Si el archivo no existe, imprime un aviso y retorna un diccionario
+    vacío (el sistema funcionará en modo solo-detección sin reconocimiento).
+
+    Args:
+        dispositivo: torch.device al que mover los embeddings.
+
+    Returns:
+        dict: {nombre_str: embedding_tensor} con tensores en el dispositivo indicado.
+    """
+    if not _ARCHIVO_EMBEDDINGS.exists():
+        print(
+            "[FACENET] No se encontró base de datos de rostros.\n"
+            f"          Ruta esperada: {_ARCHIVO_EMBEDDINGS}\n"
+            "          El sistema funcionará en modo solo-detección."
+        )
+        return {}
+
+    registros = torch.load(_ARCHIVO_EMBEDDINGS, weights_only=False)
+    # Mover cada embedding al dispositivo de inferencia
+    registros = {nombre: emb.to(dispositivo) for nombre, emb in registros.items()}
+    print(f"[FACENET] Base de datos cargada: {len(registros)} usuario(s) registrado(s).")
+    return registros
+
+
+def _identificar_rostro(
+    roi_bgr,
+    mtcnn: MTCNN,
+    modelo_facenet: InceptionResnetV1,
+    base_rostros: dict,
+    dispositivo: torch.device,
+) -> str | None:
+    """
+    Dado un recorte BGR (ROI de persona), intenta identificar el rostro.
+
+    Pipeline:
+        1. BGR -> RGB
+        2. MTCNN detecta/recorta rostro -> tensor (3, 160, 160) o None
+        3. InceptionResnetV1 extrae embedding (512,)
+        4. Compara contra todos los registros con distancia L2
+        5. Si la menor distancia < umbral -> retorna nombre
+
+    Args:
+        roi_bgr:         Recorte BGR de la persona detectada por YOLO.
+        mtcnn:           Instancia de MTCNN.
+        modelo_facenet:  Instancia de InceptionResnetV1.
+        base_rostros:    Diccionario {nombre: embedding}.
+        dispositivo:     torch.device.
+
+    Returns:
+        str | None: Nombre del usuario reconocido, o None si no hay match.
+    """
+    if not base_rostros:
+        return None
+
+    # 1. Convertir BGR -> RGB
+    roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+
+    # 2. Detectar y recortar rostro
+    rostro = mtcnn(roi_rgb)
+    if rostro is None:
+        return None
+
+    # 3. Extraer embedding
+    rostro_batch = rostro.unsqueeze(0).to(dispositivo)
+    with torch.no_grad():
+        embedding_actual = modelo_facenet(rostro_batch).squeeze(0)
+
+    # 4. Comparar contra la base de datos
+    mejor_nombre = None
+    mejor_distancia = float("inf")
+
+    for nombre, embedding_reg in base_rostros.items():
+        distancia = torch.dist(embedding_actual, embedding_reg, p=2).item()
+        if distancia < mejor_distancia:
+            mejor_distancia = distancia
+            mejor_nombre = nombre
+
+    # 5. Verificar umbral
+    if mejor_distancia < _UMBRAL_RECONOCIMIENTO:
+        return mejor_nombre
+
+    return None
+
+
 def iniciar_stream(url: str) -> None:
     """
-    Abre el stream RTMP, detecta personas con YOLOv8 (GPU) y muestra
-    los frames anotados en tiempo real mediante OpenCV.
+    Abre el stream RTMP, detecta personas con YOLOv8 (GPU), identifica
+    rostros con FaceNet y emite alertas sonoras al reconocer usuarios.
 
     Arquitectura de hilos:
         - Hilo secundario (LectorStream): drena el buffer RTMP, conserva
-          solo el último frame → latencia de buffer = 0.
+          solo el último frame -> latencia de buffer = 0.
         - Hilo principal: toma el último frame, ejecuta inferencia YOLO,
-          dibuja bounding boxes + texto de estado, muestra resultado.
+          luego FaceNet por cada persona detectada, dibuja resultados.
 
     Pipeline por frame (hilo principal):
-        1. lector.leer()                → último frame BGR (sin latencia)
-        2. modelo(frame, classes=[0])   → inferencia YOLO (GPU/CUDA)
-        3. Extraer bounding boxes       → coordenadas (x1, y1, x2, y2)
-        4. Anotación sobre frame BGR    → rectángulos + texto de estado
-        5. cv2.imshow()                 → frame anotado en BGR
-
-    El bucle termina cuando:
-        - El usuario presiona 'q'.
-        - El LectorStream señala que el stream se perdió.
+        1. lector.leer()                -> último frame BGR (sin latencia)
+        2. modelo_yolo(frame, cls=[0])  -> bounding boxes de personas
+        3. Por cada persona:
+           a. Recortar ROI del frame
+           b. MTCNN(roi) -> rostro aislado
+           c. InceptionResnetV1(rostro) -> embedding 512D
+           d. Distancia L2 vs base de datos -> nombre o "Desconocido"
+        4. Dibujar bounding boxes con nombre + texto de estado
+        5. cv2.imshow() -> frame anotado en BGR
 
     Al salir se detiene el hilo lector y se destruyen las ventanas OpenCV.
 
     Args:
         url (str): Dirección RTMP validada y persistida por la Fase 1.
     """
+    # ── Configurar dispositivo GPU/CPU ─────────────────────────────────
+    dispositivo = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[SISTEMA] Dispositivo de inferencia: {dispositivo}")
+
     # ── Cargar modelo YOLO ─────────────────────────────────────────────
-    # yolov8n.pt = modelo "nano" (el más rápido). Se descarga automática-
-    # mente la primera vez. Ultralytics detectará CUDA si está disponible.
     print("[YOLO] Cargando modelo YOLOv8n...")
-    modelo = YOLO("yolov8n.pt")
+    modelo_yolo = YOLO("yolov8n.pt")
     print("[YOLO] Modelo cargado correctamente.")
+
+    # ── Cargar modelos FaceNet ─────────────────────────────────────────
+    print("[FACENET] Cargando MTCNN (detección facial)...")
+    mtcnn = MTCNN(
+        image_size=160,
+        margin=20,
+        select_largest=True,
+        post_process=True,
+        device=dispositivo,
+    )
+
+    print("[FACENET] Cargando InceptionResnetV1 (embeddings)...")
+    modelo_facenet = InceptionResnetV1(
+        pretrained="vggface2",
+    ).eval().to(dispositivo)
+    print("[FACENET] Modelos FaceNet cargados correctamente.")
+
+    # ── Cargar base de datos de rostros ────────────────────────────────
+    base_rostros = _cargar_base_rostros(dispositivo)
+
+    # ── Set de usuarios ya saludados (one-shot por sesión) ─────────────
+    usuarios_saludados: set[str] = set()
 
     # ── Iniciar lector de stream con hilo en segundo plano ─────────────
     print(f"[STREAM] Conectando a: {url}")
@@ -429,30 +560,82 @@ def iniciar_stream(url: str) -> None:
             if lector._detenido:
                 print("[STREAM] El stream se ha interrumpido.")
                 break
-            # Esperar brevemente a que el hilo lector obtenga el primer frame
             cv2.waitKey(30)
             continue
 
         # 1. Inferencia YOLO — solo clase 0 (person), sin verbose.
-        #    Ultralytics usa CUDA automáticamente si torch.cuda.is_available().
-        resultados = modelo(frame, classes=[0], verbose=False)
+        resultados = modelo_yolo(frame, classes=[0], verbose=False)
 
         # 2. Extraer bounding boxes del primer (y único) resultado
         cajas = resultados[0].boxes
 
-        # 3. Anotar el frame BGR original
+        # 3. Para cada persona detectada: identificar + anotar
         if len(cajas) > 0:
             for caja in cajas:
-                # xyxy devuelve tensor [x1, y1, x2, y2] en píxeles absolutos
                 x1, y1, x2, y2 = caja.xyxy[0].int().tolist()
+
+                # -- Intentar reconocimiento facial --
+                nombre_detectado = None
+                try:
+                    # Recortar la ROI de la persona del frame original
+                    alto_frame, ancho_frame = frame.shape[:2]
+                    rx1 = max(0, x1)
+                    ry1 = max(0, y1)
+                    rx2 = min(ancho_frame, x2)
+                    ry2 = min(alto_frame, y2)
+
+                    roi = frame[ry1:ry2, rx1:rx2]
+
+                    # Validar que el recorte tenga dimensiones razonables
+                    if roi.shape[0] > 30 and roi.shape[1] > 30:
+                        nombre_detectado = _identificar_rostro(
+                            roi, mtcnn, modelo_facenet,
+                            base_rostros, dispositivo,
+                        )
+                except Exception as exc:
+                    # Si falla el recorte o el tensor por dimensiones,
+                    # simplemente continuamos sin identificar
+                    print(f"[ADVERTENCIA] Error en reconocimiento facial: {exc}")
+
+                # -- Dibujar bounding box + etiqueta --
+                if nombre_detectado:
+                    # Persona reconocida -> bounding box verde + nombre
+                    color_caja = _COLOR_BOX_OK
+                    etiqueta = nombre_detectado
+
+                    # Alerta sonora one-shot (sin bloquear el hilo principal)
+                    if nombre_detectado not in usuarios_saludados:
+                        usuarios_saludados.add(nombre_detectado)
+                        print(f"[ALERTA] Usuario reconocido: {nombre_detectado}")
+                        winsound.PlaySound(
+                            "SystemAsterisk",
+                            winsound.SND_ALIAS | winsound.SND_ASYNC,
+                        )
+                else:
+                    # Persona no reconocida -> bounding box amarillo
+                    color_caja = _COLOR_AMARILLO
+                    etiqueta = "Desconocido"
+
                 cv2.rectangle(
-                    frame,
-                    (x1, y1), (x2, y2),
-                    _COLOR_BOX,
-                    thickness=2,
+                    frame, (x1, y1), (x2, y2),
+                    color_caja, thickness=2,
                 )
 
-            # Overlay de estado — texto verde
+                # Fondo semitransparente para la etiqueta (mejor legibilidad)
+                (tw, th), _ = cv2.getTextSize(
+                    etiqueta, _FUENTE, 0.6, 1,
+                )
+                cv2.rectangle(
+                    frame,
+                    (x1, y1 - th - 10), (x1 + tw + 8, y1),
+                    color_caja, -1,
+                )
+                cv2.putText(
+                    frame, etiqueta, (x1 + 4, y1 - 6),
+                    _FUENTE, 0.6, (0, 0, 0), 1, cv2.LINE_AA,
+                )
+
+            # Overlay de estado global — texto verde
             estado_texto = f"ESTADO: {len(cajas)} Persona(s) detectada(s)"
             cv2.putText(
                 frame, estado_texto, _POS_TEXTO,
@@ -487,14 +670,15 @@ def iniciar_stream(url: str) -> None:
 
 def main() -> None:
     """
-    Punto de entrada principal del programa (Fases 1, 2 y 3.2).
+    Punto de entrada principal del programa (Fases 1-5).
 
     Secuencia:
         1. Carga la configuración previa y lanza la UI de tkinter (Fase 1).
         2. Una vez cerrada la UI con éxito, recupera la URL validada
            leyendo nuevamente `config.json` (fuente de verdad compartida).
         3. Si existe una URL válida, inicia el stream con detección de
-           personas vía YOLO + multithreading (Fases 2 + 3.2).
+           personas (YOLO), reconocimiento facial (FaceNet) y alertas
+           sonoras (winsound) via multithreading (Fases 2-5).
         4. Si la ventana fue cerrada sin guardar (e.g. clic en la X),
            la URL estará vacía y el programa termina sin iniciar el stream.
     """
@@ -505,7 +689,7 @@ def main() -> None:
     VentanaConfig(root, url_inicial=url_guardada)
     root.mainloop()   # Bloquea hasta que el usuario destruya la ventana
 
-    # ── Fases 2 + 3.2: Stream con YOLO + multithreading ───────────────
+    # ── Fases 2-5: Stream + YOLO + FaceNet + Alertas ──────────────────
     # Releer config.json como fuente de verdad: garantiza que usamos la
     # URL recién guardada incluso si el usuario la modificó en la UI.
     url_activa = cargar_config()
