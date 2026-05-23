@@ -1,13 +1,15 @@
 """
-Project mini-Argos v1 — Fase 7.3: UI + IA + Registro + Delay Anti-Spam
-=======================================================================
+Project mini-Argos v1 — Fase 7.4: UI + IA + Registro + Delay Anti-Spam + TTS Asíncrono
+=========================================================================================
 Módulo de interfaz gráfica del proyecto. Gestiona el login, control de cámaras
 (RTMP + Dron), visualización en vivo (YOLOv8 + FaceNet), alertas con delay de 5s
-para intrusos, ventana de registro en monitor secundario y recarga thread-safe de
-la base de embeddings sin reiniciar la app.
+para intrusos, alertas de voz tácticas (pyttsx3, no bloqueantes), ventana de
+registro en monitor secundario y recarga thread-safe de la base de embeddings
+sin reiniciar la app.
 """
 
 import sys
+import queue
 import threading
 import json
 import winsound
@@ -354,6 +356,79 @@ class SwitchToggle(QCheckBox):
 
 
 # ---------------------------------------------------------------------------
+# Hilo de Voz TTS Asíncrono (Anti-Congelamiento)
+# ---------------------------------------------------------------------------
+
+class HiloVoz(threading.Thread):
+    """
+    Motor Text-to-Speech no bloqueante usando pyttsx3 + queue.Queue.
+
+    CRÍTICO (Windows COM): pyttsx3.init() se llama dentro de run() para que
+    CoInitialize/CoUninitialize operen en el mismo hilo nativo. Hacerlo en
+    __init__ provoca errores de COM cuando el hilo de Qt crea el objeto.
+
+    Protocolo de parada: encolar None actúa como sentinel; detener() lo hace
+    y luego bloquea hasta que el hilo termina (join con timeout de seguridad).
+    """
+
+    def __init__(self, cola: queue.Queue):
+        super().__init__(daemon=True, name="HiloVoz")
+        self._cola = cola
+
+    def run(self):
+        # ── Inicialización COM-safe: SIEMPRE dentro de run() ───────────────
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+        except Exception as exc:
+            print(f"[VOZ] No se pudo inicializar pyttsx3: {exc}. Sin alertas de voz.")
+            return
+
+        # ── Selección de voz en español ────────────────────────────────────
+        voces = engine.getProperty('voices')
+        voz_es = None
+        _keywords = ('es-es', 'es-mx', 'es-us', 'spanish', 'español',
+                     'helena', 'sabina', 'pablo', 'laura', 'jorge')
+        for voz in voces:
+            id_lower  = voz.id.lower()
+            nom_lower = (voz.name or "").lower()
+            if any(k in id_lower or k in nom_lower for k in _keywords):
+                voz_es = voz
+                break
+
+        if voz_es:
+            engine.setProperty('voice', voz_es.id)
+            print(f"[VOZ] Voz española activa: {voz_es.name}")
+        else:
+            print("[VOZ] Voz española no encontrada; usando voz por defecto.")
+
+        engine.setProperty('rate', 160)   # palabras por minuto
+        print("[VOZ] Motor TTS listo.")
+
+        # ── Bucle principal: siempre vivo, procesa cola ────────────────────
+        while True:
+            texto = self._cola.get()
+            if texto is None:             # sentinel → salir
+                break
+            try:
+                engine.say(texto)
+                engine.runAndWait()
+            except Exception as exc:
+                print(f"[VOZ] Error al sintetizar: {exc}")
+
+        try:
+            engine.stop()
+        except Exception:
+            pass
+        print("[VOZ] Motor TTS detenido.")
+
+    def detener(self):
+        """Encola el sentinel de parada y espera cierre limpio."""
+        self._cola.put(None)
+        self.join(timeout=4.0)
+
+
+# ---------------------------------------------------------------------------
 # Clase: Lector de Stream RTMP (Drenado Asíncrono de Buffer)
 # ---------------------------------------------------------------------------
 
@@ -452,13 +527,16 @@ def _identificar_rostro(
 class HiloProcesamientoIA(QThread):
     """
     Hilo secundario que encapsula la inferencia de YOLOv8, FaceNet,
-    evaluación de permisos de acceso, emisión de alertas con delay anti-spam
-    y alarmas sonoras en bucle.
+    evaluación de permisos de acceso, emisión de alertas con delay anti-spam,
+    alertas de voz tácticas (A/B/C) y alarmas sonoras en bucle.
 
-    Delay de 5 segundos para intrusos:
+    Delay de 5 segundos para INTRUSOS DESCONOCIDOS:
         - Antes de los 5s: recuadro AMARILLO, sin sonido ni log.
-        - Tras 5s continuos: recuadro ROJO, alarma, señal de alerta.
-        - Si la zona se despeja: se reinicia el contador de gracia.
+        - Tras 5s continuos: recuadro ROJO, alarma winsound + aviso de voz.
+        - Si la zona se despeja: reinicia contador, bandera y alarma.
+
+    Usuarios conocidos sin permiso de área: recuadro ROJO inmediato + voz
+    con histéresis propia (sin alarma winsound).
 
     Recarga en caliente de embeddings:
         - recargar_embeddings() puede invocarse desde el hilo principal
@@ -470,11 +548,12 @@ class HiloProcesamientoIA(QThread):
     signal_stats  = pyqtSignal(int, int, float)  # (personas, nuevos, fps)
     signal_error  = pyqtSignal(str)
 
-    def __init__(self, rtmp_url: str, parent=None):
+    def __init__(self, rtmp_url: str, cola_voz: queue.Queue, parent=None):
         super().__init__(parent)
-        self.rtmp_url = rtmp_url
-        self._running = True
-        self.lector   = None
+        self.rtmp_url   = rtmp_url
+        self._cola_voz  = cola_voz
+        self._running   = True
+        self.lector     = None
         # Flag thread-safe para solicitar recarga de embeddings
         self._reload_embeddings = False
         self._dispositivo = None   # se asigna al arrancar run()
@@ -529,6 +608,10 @@ class HiloProcesamientoIA(QThread):
         # ── Estado del delay anti-spam ──────────────────────────────
         tiempo_inicio_desconocido: float | None = None
 
+        # ── Estado TTS: histéresis y bandera de aviso de intruso ───
+        memoria_no_autorizados: dict = {}   # {nombre: timestamp último aviso voz}
+        advertencia_voz_dicha: bool  = False
+
         while self._running:
             if self._reload_embeddings:
                 self._reload_embeddings = False
@@ -550,7 +633,9 @@ class HiloProcesamientoIA(QThread):
                     # Vaciando memorias de tiempo
                     self.memoria_autorizados.clear()
                     alertas_recientes.clear()
+                    memoria_no_autorizados.clear()
                     tiempo_inicio_desconocido = None
+                    advertencia_voz_dicha = False
                     
                 print("[IA] Configuración de permisos e IA recargada (Reinicio Táctico).")
 
@@ -572,7 +657,7 @@ class HiloProcesamientoIA(QThread):
             cajas = resultados[0].boxes
 
             hay_no_autorizado_en_frame = False
-            hay_autorizado_en_frame = False
+            hay_desconocido_en_frame   = False
             personas_detectadas = len(cajas)
 
             if personas_detectadas > 0:
@@ -594,23 +679,42 @@ class HiloProcesamientoIA(QThread):
                     except Exception as exc:
                         print(f"[ADVERTENCIA] Error en reconocimiento facial: {exc}")
 
-                    # Evaluar autorización
+                    # ── A / B / C: autorización + alertas de voz ──────────
+                    ahora = time.time()
+
                     if nombre_detectado and nombre_detectado in lista_autorizados:
-                        color_caja = (80, 220, 0)           # Verde (#00DC50) BGR
+                        # ── A. AUTORIZADO ────────────────────────────────
+                        color_caja = (80, 220, 0)           # Verde BGR
                         etiqueta   = f"{nombre_detectado} - AUTORIZADO"
 
-                        ahora = time.time()
                         ultimo_visto = self.memoria_autorizados.get(nombre_detectado, 0.0)
-
-                        if nombre_detectado not in self.memoria_autorizados or (ahora - ultimo_visto) > 4.0:
+                        if (ahora - ultimo_visto) > 4.0:
                             print(f"[IA] {nombre_detectado} autorizado detectado.")
                             self.signal_alerta.emit(nombre_detectado, _AREA_ACTUAL, True)
-                            
+                            self._cola_voz.put(f"{nombre_detectado}, reconocido.")
                         self.memoria_autorizados[nombre_detectado] = ahora
-                    else:
+
+                    elif nombre_detectado:
+                        # ── B. CONOCIDO PERO SIN PERMISO DE ÁREA ────────
                         hay_no_autorizado_en_frame = True
-                        display_nombre = nombre_detectado if nombre_detectado else "Desconocido"
-                        ahora = time.time()
+                        color_caja = (77, 77, 255)          # Rojo BGR
+                        etiqueta   = f"{nombre_detectado} - NO AUTORIZADO"
+
+                        if (ahora - alertas_recientes.get(nombre_detectado, 0.0)) > 15.0:
+                            self.signal_alerta.emit(nombre_detectado, _AREA_ACTUAL, False)
+                            alertas_recientes[nombre_detectado] = ahora
+
+                        if (ahora - memoria_no_autorizados.get(nombre_detectado, 0.0)) > 15.0:
+                            self._cola_voz.put(
+                                f"{nombre_detectado} reconocido. "
+                                "No está autorizado para estar en esta área."
+                            )
+                            memoria_no_autorizados[nombre_detectado] = ahora
+
+                    else:
+                        # ── C. COMPLETAMENTE DESCONOCIDO ────────────────
+                        hay_no_autorizado_en_frame = True
+                        hay_desconocido_en_frame   = True
 
                         if tiempo_inicio_desconocido is None:
                             tiempo_inicio_desconocido = ahora
@@ -618,15 +722,23 @@ class HiloProcesamientoIA(QThread):
                         segundos_intruso = ahora - tiempo_inicio_desconocido
 
                         if segundos_intruso >= _DELAY_INTRUSO_SEG:
-                            color_caja = (77, 77, 255)        # Rojo (#FF4D4D) BGR
-                            etiqueta   = f"{display_nombre} - NO AUTORIZADO"
+                            color_caja = (77, 77, 255)      # Rojo BGR
+                            etiqueta   = "Desconocido - NO AUTORIZADO"
 
-                            if ahora - alertas_recientes.get(display_nombre, 0.0) > 15.0:
-                                self.signal_alerta.emit(display_nombre, _AREA_ACTUAL, False)
-                                alertas_recientes[display_nombre] = ahora
+                            if (ahora - alertas_recientes.get("Desconocido", 0.0)) > 15.0:
+                                self.signal_alerta.emit("Desconocido", _AREA_ACTUAL, False)
+                                alertas_recientes["Desconocido"] = ahora
+
+                            # Aviso de voz: una sola vez por evento de intrusión
+                            if not advertencia_voz_dicha:
+                                self._cola_voz.put(
+                                    "Usuario Desconocido, "
+                                    "abandone el área o se dará alerta."
+                                )
+                                advertencia_voz_dicha = True
                         else:
-                            color_caja = (0, 211, 255)      # Amarillo (#FFD300) BGR
-                            etiqueta   = f"{display_nombre} [Evaluando...]"
+                            color_caja = (0, 211, 255)      # Amarillo BGR
+                            etiqueta   = "Desconocido [Evaluando...]"
 
                     # Pintar SIEMPRE
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color_caja, 2)
@@ -650,14 +762,13 @@ class HiloProcesamientoIA(QThread):
 
             self.signal_stats.emit(personas_detectadas, 0, fps)
 
-            # ── Gestión de alarma + reset del timer de gracia ──────────────
-            if hay_no_autorizado_en_frame:
-                # Determinar si ya superó la gracia para disparar alarma
+            # ── Gestión de alarma (solo desconocidos reales) ───────────────
+            if hay_desconocido_en_frame:
                 if (tiempo_inicio_desconocido is not None and
                         time.time() - tiempo_inicio_desconocido >= _DELAY_INTRUSO_SEG):
                     if not alarma_activa:
                         alarma_activa = True
-                        print("[ALARMA] ¡Intruso confirmado tras 5s! Activando alarma...")
+                        print("[ALARMA] Intruso desconocido confirmado tras 5s. Activando alarma...")
                         try:
                             winsound.PlaySound(
                                 "SystemHand",
@@ -666,8 +777,9 @@ class HiloProcesamientoIA(QThread):
                         except Exception:
                             pass
             else:
-                # Zona despejada → reset completo
+                # Zona despejada de desconocidos → reset completo
                 tiempo_inicio_desconocido = None
+                advertencia_voz_dicha = False
                 if alarma_activa:
                     alarma_activa = False
                     print("[ALARMA] Zona despejada. Desactivando alarma.")
@@ -1981,6 +2093,11 @@ class VentanaPrincipal(QMainWindow):
         # Conectar botón de registro al abrir VentanaRegistro
         self.control.btn_registro.clicked.connect(self._abrir_registro)
 
+        # Motor de voz asíncrono (singleton para toda la sesión)
+        self._cola_voz = queue.Queue()
+        self._hilo_voz = HiloVoz(self._cola_voz)
+        self._hilo_voz.start()
+
         # Referencia del hilo de IA y ventana de registro
         self.hilo_ia           = None
         self._ventana_registro = None
@@ -2075,7 +2192,7 @@ class VentanaPrincipal(QMainWindow):
                 self.hilo_ia = None
 
             # Lanzar Hilo IA de procesamiento en segundo plano
-            self.hilo_ia = HiloProcesamientoIA(url)
+            self.hilo_ia = HiloProcesamientoIA(url, self._cola_voz)
             self.hilo_ia.signal_frame.connect(self.monitor.mostrar_frame)
             self.hilo_ia.signal_alerta.connect(self.alertas.agregar_alerta)
             self.hilo_ia.signal_stats.connect(self.control.actualizar_stats)
@@ -2115,20 +2232,25 @@ class VentanaPrincipal(QMainWindow):
         self.control.chk_cam1.setChecked(False)
 
     def closeEvent(self, event):
-        """Asegura el apagado correcto del hilo de inferencia y alarmas al cerrar."""
+        """Asegura el apagado correcto de todos los hilos al cerrar."""
         print("[APP] Cerrando aplicación de forma segura...")
-        
+
         # Apagar inmediatamente cualquier sonido en bucle
         try:
             winsound.PlaySound(None, winsound.SND_PURGE)
         except Exception:
             pass
 
-        # Detener hilo secundario
+        # Detener hilo IA
         if self.hilo_ia:
             print("[APP] Deteniendo Hilo IA secundario...")
             self.hilo_ia.stop()
             self.hilo_ia = None
+
+        # Detener motor de voz (sentinel None + join)
+        if hasattr(self, '_hilo_voz'):
+            print("[APP] Deteniendo motor de voz TTS...")
+            self._hilo_voz.detener()
 
         print("[APP] Recursos liberados con éxito.")
         event.accept()
