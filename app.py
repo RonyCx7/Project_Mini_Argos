@@ -24,7 +24,7 @@ from ultralytics import YOLO
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QCheckBox,
     QStackedWidget, QSizePolicy, QSpacerItem, QGraphicsDropShadowEffect,
-    QTextEdit, QFileDialog, QMessageBox)
+    QTextEdit, QFileDialog, QMessageBox, QGridLayout, QInputDialog, QListWidget, QListWidgetItem)
 from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, pyqtSlot, pyqtProperty, QRect, QPoint
 from PyQt6.QtGui import QPixmap, QFont, QColor, QIcon, QImage, QPainter, QBrush, QPen
 
@@ -56,13 +56,46 @@ def guardar_config(url: str) -> None:
     except OSError as exc:
         print(f"[ERROR] No se pudo guardar la configuración: {exc}")
 
-# Área activa y permisos (de main.py)
+# Área activa (de main.py)
 _AREA_ACTUAL = "Area 1"
-_USUARIOS_AUTORIZADOS = {
-    "Area 1": ["Juan Perez", "Maria Lopez"],
-}
+
 _UMBRAL_RECONOCIMIENTO = 0.8
-_ARCHIVO_EMBEDDINGS = Path(__file__).parent / "rostros" / "embeddings.pt"
+DIR_ROSTROS = Path(__file__).parent / "rostros"
+DIR_AVATARES = DIR_ROSTROS / "avatares"
+_ARCHIVO_EMBEDDINGS = DIR_ROSTROS / "embeddings.pt"
+AREAS_CONFIG_FILE = DIR_ROSTROS / "areas_config.json"
+USUARIOS_CONFIG_FILE = DIR_ROSTROS / "usuarios_config.json"
+
+def cargar_json(ruta: Path, default_data: dict) -> dict:
+    if not ruta.parent.exists():
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+    if not ruta.exists():
+        with ruta.open("w", encoding="utf-8") as f:
+            json.dump(default_data, f, indent=4, ensure_ascii=False)
+        return default_data
+    try:
+        with ruta.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Al leer JSON {ruta.name}: {e}")
+        return default_data
+
+def guardar_json(ruta: Path, data: dict):
+    if not ruta.parent.exists():
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+    with ruta.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def inicializar_archivos_fase74():
+    DIR_AVATARES.mkdir(parents=True, exist_ok=True)
+    areas_default = {"Area 1": {"descripcion": "RTMP Principal", "activa": True},
+                     "Area 2": {"descripcion": "Cámara Dron", "activa": False}}
+    usuarios_default = {"admin": {"avatar": "", "permisos": ["Area 1", "Area 2"]}}
+    cargar_json(AREAS_CONFIG_FILE, areas_default)
+    cargar_json(USUARIOS_CONFIG_FILE, usuarios_default)
+
+# Ejecutar inicialización de archivos JSON al cargar el módulo
+inicializar_archivos_fase74()
 
 # Lock global para lectura/escritura thread-safe de embeddings.pt
 _LOCK_EMBEDDINGS = threading.Lock()
@@ -471,10 +504,14 @@ class HiloProcesamientoIA(QThread):
             pretrained="vggface2",
         ).eval().to(self._dispositivo)
 
-        # Carga inicial con lock
         with _LOCK_EMBEDDINGS:
             base_rostros = _cargar_base_rostros(self._dispositivo)
-        lista_autorizados = _USUARIOS_AUTORIZADOS.get(_AREA_ACTUAL, [])
+        
+        usuarios_config = cargar_json(USUARIOS_CONFIG_FILE, {})
+        lista_autorizados = []
+        for uname, udata in usuarios_config.items():
+            if _AREA_ACTUAL in udata.get("permisos", []):
+                lista_autorizados.append(uname)
 
         self.lector = LectorStream(self.rtmp_url)
         if not self.lector.esta_abierto:
@@ -487,19 +524,35 @@ class HiloProcesamientoIA(QThread):
         counter_fps      = 0
         fps              = 0.0
         alertas_recientes: dict = {}   # {nombre: timestamp}
+        self.memoria_autorizados = {}
 
         # ── Estado del delay anti-spam ──────────────────────────────
-        # None = no hay intruso activo en este momento.
-        # float = time.time() cuando se detectó el primer intruso del ciclo.
         tiempo_inicio_desconocido: float | None = None
 
         while self._running:
-            # ── Recarga en caliente de embeddings (solicitada por el registro) ──
             if self._reload_embeddings:
                 self._reload_embeddings = False
                 with _LOCK_EMBEDDINGS:
                     base_rostros = _cargar_base_rostros(self._dispositivo)
                 print("[IA] Base de rostros recargada en caliente.")
+
+            if getattr(self, '_reload_config', False):
+                with threading.Lock():
+                    self._reload_config = False
+                    usuarios_config = cargar_json(USUARIOS_CONFIG_FILE, {})
+                    lista_autorizados.clear()
+                    for uname, udata in usuarios_config.items():
+                        if _AREA_ACTUAL in udata.get("permisos", []):
+                            lista_autorizados.append(uname)
+                    with _LOCK_EMBEDDINGS:
+                        base_rostros = _cargar_base_rostros(self._dispositivo)
+                    
+                    # Vaciando memorias de tiempo
+                    self.memoria_autorizados.clear()
+                    alertas_recientes.clear()
+                    tiempo_inicio_desconocido = None
+                    
+                print("[IA] Configuración de permisos e IA recargada (Reinicio Táctico).")
 
             frame = self.lector.leer()
             if frame is None:
@@ -508,7 +561,6 @@ class HiloProcesamientoIA(QThread):
                 self.msleep(30)
                 continue
 
-            # Cálculo de FPS
             curr_time = time.time()
             counter_fps += 1
             if curr_time - prev_time >= 1.0:
@@ -516,17 +568,16 @@ class HiloProcesamientoIA(QThread):
                 counter_fps = 0
                 prev_time = curr_time
 
-            # Inferencia YOLOv8
             resultados = modelo_yolo(frame, classes=[0], verbose=False)
             cajas = resultados[0].boxes
 
             hay_no_autorizado_en_frame = False
+            hay_autorizado_en_frame = False
             personas_detectadas = len(cajas)
 
             if personas_detectadas > 0:
                 for caja in cajas:
                     x1, y1, x2, y2 = caja.xyxy[0].int().tolist()
-
                     nombre_detectado = None
                     try:
                         alto_frame, ancho_frame = frame.shape[:2]
@@ -545,43 +596,39 @@ class HiloProcesamientoIA(QThread):
 
                     # Evaluar autorización
                     if nombre_detectado and nombre_detectado in lista_autorizados:
-                        # ── AUTORIZADO ────────────────────────────────────────
-                        color_caja = (0, 220, 80)           # Verde neón
+                        color_caja = (80, 220, 0)           # Verde (#00DC50) BGR
                         etiqueta   = f"{nombre_detectado} - AUTORIZADO"
-                        autorizado = True
 
                         ahora = time.time()
-                        if ahora - alertas_recientes.get(nombre_detectado, 0.0) > 10.0:
+                        ultimo_visto = self.memoria_autorizados.get(nombre_detectado, 0.0)
+
+                        if nombre_detectado not in self.memoria_autorizados or (ahora - ultimo_visto) > 4.0:
+                            print(f"[IA] {nombre_detectado} autorizado detectado.")
                             self.signal_alerta.emit(nombre_detectado, _AREA_ACTUAL, True)
-                            alertas_recientes[nombre_detectado] = ahora
+                            
+                        self.memoria_autorizados[nombre_detectado] = ahora
                     else:
-                        # ── NO AUTORIZADO / DESCONOCIDO ───────────────────────
                         hay_no_autorizado_en_frame = True
-                        autorizado = False
                         display_nombre = nombre_detectado if nombre_detectado else "Desconocido"
                         ahora = time.time()
 
-                        # Iniciar (o mantener) el contador de gracia
                         if tiempo_inicio_desconocido is None:
                             tiempo_inicio_desconocido = ahora
 
                         segundos_intruso = ahora - tiempo_inicio_desconocido
 
                         if segundos_intruso >= _DELAY_INTRUSO_SEG:
-                            # Superó la gracia → rojo + alarma + log
-                            color_caja = (0, 0, 255)        # Rojo puro BGR
+                            color_caja = (77, 77, 255)        # Rojo (#FF4D4D) BGR
                             etiqueta   = f"{display_nombre} - NO AUTORIZADO"
 
-                            if ahora - alertas_recientes.get(display_nombre, 0.0) > 10.0:
+                            if ahora - alertas_recientes.get(display_nombre, 0.0) > 15.0:
                                 self.signal_alerta.emit(display_nombre, _AREA_ACTUAL, False)
                                 alertas_recientes[display_nombre] = ahora
                         else:
-                            # Dentro del periodo de gracia → amarillo, sin log ni sonido
-                            color_caja = (0, 200, 255)      # Amarillo BGR
-                            secs_left  = int(_DELAY_INTRUSO_SEG - segundos_intruso) + 1
-                            etiqueta   = f"{display_nombre} [{secs_left}s...]"
+                            color_caja = (0, 211, 255)      # Amarillo (#FFD300) BGR
+                            etiqueta   = f"{display_nombre} [Evaluando...]"
 
-                    # Pintar bbox + etiqueta
+                    # Pintar SIEMPRE
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color_caja, 2)
                     (tw, th), _ = cv2.getTextSize(etiqueta, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
                     cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 8, y1), color_caja, -1)
@@ -590,6 +637,7 @@ class HiloProcesamientoIA(QThread):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA
                     )
 
+            if personas_detectadas > 0:
                 cv2.putText(
                     frame, f"ESTADO: {personas_detectadas} Persona(s) detectada(s)",
                     (14, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 80), 2, cv2.LINE_AA
@@ -645,16 +693,12 @@ class HiloProcesamientoIA(QThread):
 
     @pyqtSlot()
     def recargar_embeddings(self):
-        """
-        Slot thread-safe invocado desde el hilo principal cuando
-        VentanaRegistro guarda un nuevo usuario en embeddings.pt.
-
-        Simplemente activa la bandera; el bucle run() la comprueba
-        al inicio de cada iteración y hace el torch.load() protegido
-        con _LOCK_EMBEDDINGS.
-        """
         self._reload_embeddings = True
         print("[IA] Recarga de embeddings solicitada.")
+
+    @pyqtSlot()
+    def recargar_configuracion(self):
+        self._reload_config = True
 
     def stop(self):
         self._running = False
@@ -916,6 +960,7 @@ class PanelControl(QFrame):
         self.btn_monitor = self._crear_boton_nav("🖥  Monitor en Vivo")
         self.btn_registro = self._crear_boton_nav("👤  Registro de Usuarios")
         self.btn_restricciones = self._crear_boton_nav("🔒  Restricciones de Usuario")
+        self.btn_areas = self._crear_boton_nav("🗺  Gestión de Áreas")
 
         # Conectar señales
         self.btn_monitor.clicked.connect(
@@ -927,6 +972,9 @@ class PanelControl(QFrame):
         self.btn_restricciones.clicked.connect(
             lambda: print("[NAV] Restricciones de Usuario")
         )
+        self.btn_areas.clicked.connect(
+            lambda: print("[NAV] Gestión de Áreas")
+        )
 
         # Marcar el primero como activo
         self.btn_monitor.setChecked(True)
@@ -935,6 +983,7 @@ class PanelControl(QFrame):
         layout.addWidget(self.btn_monitor)
         layout.addWidget(self.btn_registro)
         layout.addWidget(self.btn_restricciones)
+        layout.addWidget(self.btn_areas)
 
         # Separador
         layout.addSpacing(12)
@@ -1270,8 +1319,7 @@ class PanelAlertas(QFrame):
         scroll.setWidget(contenido)
         layout.addWidget(scroll)
 
-        # Alertas de ejemplo (estáticas)
-        self._agregar_alertas_demo()
+        # (HOTFIX) Inicio limpio: No agregamos alertas quemadas.
 
     def _agregar_alertas_demo(self):
         """Inserta tarjetas de alerta de prueba."""
@@ -1346,6 +1394,8 @@ class HiloRegistro(QThread):
         self.signal_log.emit("[REGISTRO] Modelos FaceNet (CPU) cargados.")
 
         embeddings_validos: list[torch.Tensor] = []
+        avatar_guardado = False
+        ruta_avatar = None
 
         for i, ruta in enumerate(self.rutas, 1):
             nombre_archivo = Path(ruta).name
@@ -1370,6 +1420,14 @@ class HiloRegistro(QThread):
                 )
                 continue
 
+            if not avatar_guardado:
+                import torchvision.transforms as T
+                img_pil = T.ToPILImage()((rostro + 1) / 2)
+                ruta_avatar = DIR_AVATARES / f"{self.nombre.replace(' ', '_')}.jpg"
+                img_pil.save(ruta_avatar)
+                avatar_guardado = True
+                self.signal_log.emit(f"  ✓ Avatar guardado en {ruta_avatar.name}")
+
             with torch.no_grad():
                 emb = modelo_cpu(rostro.unsqueeze(0)).squeeze(0)
             embeddings_validos.append(emb.cpu())
@@ -1389,7 +1447,6 @@ class HiloRegistro(QThread):
         stack   = torch.stack(embeddings_validos, dim=0)
         maestro = torch.mean(stack, dim=0)
 
-        # ── Escritura thread-safe con lock global ──────────────────────
         with _LOCK_EMBEDDINGS:
             if _ARCHIVO_EMBEDDINGS.exists():
                 registros = torch.load(
@@ -1402,6 +1459,17 @@ class HiloRegistro(QThread):
             accion = "actualizado" if self.nombre in registros else "registrado"
             registros[self.nombre] = maestro
             torch.save(registros, _ARCHIVO_EMBEDDINGS)
+
+        usuarios_config = cargar_json(USUARIOS_CONFIG_FILE, {})
+        if self.nombre not in usuarios_config:
+            usuarios_config[self.nombre] = {
+                "avatar": str(ruta_avatar.name) if avatar_guardado else "",
+                "permisos": []
+            }
+        else:
+            if avatar_guardado:
+                usuarios_config[self.nombre]["avatar"] = str(ruta_avatar.name)
+        guardar_json(USUARIOS_CONFIG_FILE, usuarios_config)
 
         self.signal_log.emit(
             f"\n[DB] Usuario '{self.nombre}' {accion} exitosamente."
@@ -1546,6 +1614,9 @@ class VentanaRegistro(QMainWindow):
         )
         form_layout.addWidget(self.lbl_fotos_count)
 
+        self.grid_fotos = QGridLayout()
+        form_layout.addLayout(self.grid_fotos)
+
         form_layout.addStretch()
 
         # Botón procesar (acento verde grande)
@@ -1606,12 +1677,32 @@ class VentanaRegistro(QMainWindow):
             self.lbl_fotos_count.setStyleSheet(
                 f"color: {CLR_ACCENT}; font-size: 12px; font-weight: bold;"
             )
+            # Limpiar grid
+            for i in reversed(range(self.grid_fotos.count())): 
+                widget_to_remove = self.grid_fotos.itemAt(i).widget()
+                if widget_to_remove is not None:
+                    widget_to_remove.setParent(None)
+            
+            # Poblar grid con miniaturas (hasta 6)
+            for i, ruta in enumerate(rutas[:6]):
+                lbl_thumb = QLabel()
+                pix = QPixmap(ruta).scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                lbl_thumb.setPixmap(pix)
+                lbl_thumb.setFixedSize(100, 100)
+                lbl_thumb.setStyleSheet(f"border: 1px solid {CLR_BORDER}; border-radius: 4px;")
+                row = i // 3
+                col = i % 3
+                self.grid_fotos.addWidget(lbl_thumb, row, col)
         else:
             self._rutas_seleccionadas = []
             self.lbl_fotos_count.setText("Ninguna fotografía seleccionada")
             self.lbl_fotos_count.setStyleSheet(
                 f"color: {CLR_TEXT_SEC}; font-size: 12px;"
             )
+            for i in reversed(range(self.grid_fotos.count())): 
+                widget_to_remove = self.grid_fotos.itemAt(i).widget()
+                if widget_to_remove is not None:
+                    widget_to_remove.setParent(None)
 
     def _iniciar_procesamiento(self):
         """Valida los campos y lanza HiloRegistro."""
@@ -1661,6 +1752,147 @@ class VentanaRegistro(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
+# Pantalla de Permisos (Fase 7.4)
+# ---------------------------------------------------------------------------
+
+class PantallaPermisos(QWidget):
+    cambios_guardados = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        # ── Columna Izquierda (Directorio) ──
+        self.panel_izq = QFrame()
+        self.panel_izq.setObjectName("panel")
+        izq_layout = QVBoxLayout(self.panel_izq)
+        
+        lbl_dir = QLabel("DIRECTORIO")
+        lbl_dir.setObjectName("label-section")
+        izq_layout.addWidget(lbl_dir)
+        
+        self.lista_usuarios = QListWidget()
+        self.lista_usuarios.setStyleSheet(f"background: transparent; border: none; font-size: 14px; outline: none;")
+        self.lista_usuarios.itemClicked.connect(self._on_usuario_seleccionado)
+        izq_layout.addWidget(self.lista_usuarios)
+        
+        layout.addWidget(self.panel_izq, stretch=3)
+
+        # ── Columna Derecha (Panel de Control) ──
+        self.panel_der = QFrame()
+        self.panel_der.setObjectName("panel")
+        self.der_layout = QVBoxLayout(self.panel_der)
+        
+        self.lbl_avatar = QLabel()
+        self.lbl_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_avatar.setFixedSize(120, 120)
+        self.lbl_avatar.setStyleSheet("background: transparent;")
+        
+        self.lbl_nombre = QLabel("Seleccione un usuario")
+        self.lbl_nombre.setObjectName("label-title")
+        self.lbl_nombre.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.der_layout.addWidget(self.lbl_avatar, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.der_layout.addWidget(self.lbl_nombre, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        self.der_layout.addSpacing(20)
+        lbl_permisos = QLabel("PERMISOS DE ÁREAS")
+        lbl_permisos.setObjectName("label-section")
+        self.der_layout.addWidget(lbl_permisos)
+
+        # Contenedor para switches
+        self.contenedor_switches = QWidget()
+        self.layout_switches = QVBoxLayout(self.contenedor_switches)
+        self.der_layout.addWidget(self.contenedor_switches)
+        self.der_layout.addStretch()
+
+        self.btn_guardar = QPushButton("Guardar Cambios")
+        self.btn_guardar.setObjectName("btn-primary")
+        self.btn_guardar.clicked.connect(self._guardar_cambios)
+        self.btn_guardar.hide()
+        self.der_layout.addWidget(self.btn_guardar)
+
+        layout.addWidget(self.panel_der, stretch=7)
+        self.usuario_actual = None
+        self.switches_actuales = {}
+
+    def cargar_datos(self):
+        self.lista_usuarios.clear()
+        self.usuarios_config = cargar_json(USUARIOS_CONFIG_FILE, {})
+        self.areas_config = cargar_json(AREAS_CONFIG_FILE, {})
+        
+        for uname, udata in self.usuarios_config.items():
+            item = QListWidgetItem(uname)
+            # Intentar cargar avatar
+            avatar_file = udata.get("avatar", "")
+            if avatar_file:
+                ruta = DIR_AVATARES / avatar_file
+                if ruta.exists():
+                    pix = QPixmap(str(ruta)).scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                    item.setIcon(QIcon(pix))
+            self.lista_usuarios.addItem(item)
+            
+        self.lbl_nombre.setText("Seleccione un usuario")
+        self.lbl_avatar.clear()
+        self.btn_guardar.hide()
+        self._limpiar_switches()
+
+    def _limpiar_switches(self):
+        for i in reversed(range(self.layout_switches.count())): 
+            widget = self.layout_switches.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.switches_actuales.clear()
+
+    def _on_usuario_seleccionado(self, item):
+        self.usuario_actual = item.text()
+        self.lbl_nombre.setText(self.usuario_actual)
+        self.btn_guardar.show()
+        
+        udata = self.usuarios_config.get(self.usuario_actual, {})
+        avatar_file = udata.get("avatar", "")
+        if avatar_file:
+            ruta = DIR_AVATARES / avatar_file
+            if ruta.exists():
+                pix = QPixmap(str(ruta)).scaled(120, 120, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+                self.lbl_avatar.setPixmap(pix)
+            else:
+                self.lbl_avatar.setText("👤")
+        else:
+            self.lbl_avatar.setText("👤")
+            self.lbl_avatar.setStyleSheet("font-size: 60px; background: transparent;")
+
+        self._limpiar_switches()
+        permisos_usuario = udata.get("permisos", [])
+        
+        for area_name, area_data in self.areas_config.items():
+            desc = area_data.get("descripcion", "")
+            switch = SwitchToggle(f"{area_name} - {desc}")
+            switch.setChecked(area_name in permisos_usuario)
+            self.layout_switches.addWidget(switch)
+            self.switches_actuales[area_name] = switch
+
+    def _guardar_cambios(self):
+        if not self.usuario_actual:
+            return
+        
+        pwd, ok = QInputDialog.getText(self, "Seguridad", "Ingrese la contraseña de administrador:", QLineEdit.EchoMode.Password)
+        if ok and pwd == "admin":
+            nuevos_permisos = []
+            for area_name, switch in self.switches_actuales.items():
+                if switch.isChecked():
+                    nuevos_permisos.append(area_name)
+                    
+            self.usuarios_config[self.usuario_actual]["permisos"] = nuevos_permisos
+            guardar_json(USUARIOS_CONFIG_FILE, self.usuarios_config)
+            QMessageBox.information(self, "Éxito", f"Permisos actualizados para {self.usuario_actual}")
+            self.cambios_guardados.emit()
+        elif ok:
+            QMessageBox.warning(self, "Denegado", "Contraseña incorrecta.")
+
+# ---------------------------------------------------------------------------
 # Widget: Dashboard Principal
 # ---------------------------------------------------------------------------
 
@@ -1680,8 +1912,12 @@ class Dashboard(QWidget):
         self.panel_control.setMinimumWidth(240)
         self.panel_control.setMaximumWidth(300)
 
-        # Columna central (60%)
+        # Columna central (60%) -> Stacked Widget
+        self.stack_central = QStackedWidget()
         self.panel_monitor = PanelMonitor()
+        self.pantalla_permisos = PantallaPermisos()
+        self.stack_central.addWidget(self.panel_monitor)
+        self.stack_central.addWidget(self.pantalla_permisos)
 
         # Columna derecha (20%)
         self.panel_alertas = PanelAlertas()
@@ -1690,7 +1926,7 @@ class Dashboard(QWidget):
 
         # Proporciones: 20% - 60% - 20%
         layout.addWidget(self.panel_control, stretch=2)
-        layout.addWidget(self.panel_monitor, stretch=6)
+        layout.addWidget(self.stack_central, stretch=6)
         layout.addWidget(self.panel_alertas, stretch=2)
 
 
@@ -1735,6 +1971,13 @@ class VentanaPrincipal(QMainWindow):
         self.control.chk_cam1.stateChanged.connect(self._on_cam1_toggled)
         self.control.chk_cam2.stateChanged.connect(self._on_cam2_toggled)
 
+        # Navegación del Dashboard
+        self.control.btn_monitor.clicked.connect(self._nav_monitor)
+        self.control.btn_restricciones.clicked.connect(self._nav_permisos)
+        
+        # Conectar reinicio táctico
+        self._dashboard.pantalla_permisos.cambios_guardados.connect(self._reiniciar_camaras_tactico)
+        
         # Conectar botón de registro al abrir VentanaRegistro
         self.control.btn_registro.clicked.connect(self._abrir_registro)
 
@@ -1747,8 +1990,22 @@ class VentanaPrincipal(QMainWindow):
         self._stack.setCurrentIndex(1)
         print("[APP] Dashboard cargado exitosamente.")
 
+    def _nav_monitor(self):
+        self._dashboard.stack_central.setCurrentIndex(0)
+        self.control.btn_monitor.setChecked(True)
+        self.control.btn_restricciones.setChecked(False)
+        self.control.btn_areas.setChecked(False)
+
+    def _nav_permisos(self):
+        self._dashboard.stack_central.setCurrentIndex(1)
+        self._dashboard.pantalla_permisos.cargar_datos()
+        self.control.btn_monitor.setChecked(False)
+        self.control.btn_restricciones.setChecked(True)
+        self.control.btn_areas.setChecked(False)
+
     def _abrir_registro(self):
         """Abre la VentanaRegistro en el monitor secundario si está disponible."""
+        self.control.btn_registro.clearFocus()
         # Si ya hay una instancia abierta, solo traerla al frente
         if self._ventana_registro and self._ventana_registro.isVisible():
             self._ventana_registro.raise_()
@@ -1756,12 +2013,40 @@ class VentanaPrincipal(QMainWindow):
             return
 
         self._ventana_registro = VentanaRegistro()
-        # Conectar señal de éxito al slot de recarga en caliente del hilo IA
+        # Conectar señal de éxito al slot de recarga en caliente del hilo IA y reinicio
         if self.hilo_ia:
             self._ventana_registro.registro_exitoso.connect(
                 self.hilo_ia.recargar_embeddings
             )
+        self._ventana_registro.registro_exitoso.connect(self._reiniciar_camaras_tactico)
         self._ventana_registro.show()
+
+    def _reiniciar_camaras_tactico(self):
+        print("[SISTEMA] Iniciando reinicio táctico de cámaras...")
+        
+        cam1_on = self.control.chk_cam1.isChecked()
+        cam2_on = self.control.chk_cam2.isChecked()
+        
+        if self.hilo_ia:
+            self.hilo_ia.recargar_configuracion()
+            
+        self.control.chk_cam1.setChecked(False)
+        self.control.chk_cam2.setChecked(False)
+        
+        # Almacenar estados previos en la instancia para poder recuperarlos
+        self._cam1_was_on = cam1_on
+        self._cam2_was_on = cam2_on
+        
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(5000, lambda: self._encender_camaras_previas())
+            
+        self._nav_monitor()
+
+    def _encender_camaras_previas(self):
+        if getattr(self, '_cam1_was_on', False):
+            self.control.chk_cam1.setChecked(True)
+        if getattr(self, '_cam2_was_on', False):
+            self.control.chk_cam2.setChecked(True)
 
     def _on_cam1_toggled(self, state):
         """Manejador del switch para Cámara 1 — Inicia o detiene la IA."""

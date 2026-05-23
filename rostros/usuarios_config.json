@@ -1,0 +1,15 @@
+{
+    "admin": {
+        "avatar": "",
+        "permisos": [
+            "Area 1",
+            "Area 2"
+        ]
+    },
+    "Rony Carrillo": {
+        "avatar": "Rony_Carrillo.jpg",
+        "permisos": [
+            "Area 1"
+        ]
+    }
+}

@@ -1,0 +1,10 @@
+{
+    "Area 1": {
+        "descripcion": "RTMP Principal",
+        "activa": true
+    },
+    "Area 2": {
+        "descripcion": "Cámara Dron",
+        "activa": false
+    }
+}
